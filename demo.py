@@ -2,16 +2,16 @@
 import argparse
 import glob
 import multiprocessing as mp
-import numpy as np
 import os
+import sys
 import tempfile
 import time
 import warnings
-import cv2
-import tqdm
-import sys
-import mss
 
+import cv2
+import mss
+import numpy as np
+import tqdm
 from detectron2.config import get_cfg
 from detectron2.data.detection_utils import read_image
 from detectron2.utils.logger import setup_logger
@@ -19,8 +19,9 @@ from detectron2.utils.logger import setup_logger
 sys.path.insert(0, 'third_party/CenterNet2/')
 from centernet.config import add_centernet_config
 from detic.config import add_detic_config
-
 from detic.predictor import VisualizationDemo
+from moviepy.editor import ImageSequenceClip
+
 
 # Fake a video capture object OpenCV style - half width, half height of first screen using MSS
 class ScreenGrab:
@@ -73,6 +74,7 @@ def get_parser():
     parser.add_argument("--webcam", help="Take inputs from webcam.")
     parser.add_argument("--cpu", action='store_true', help="Use CPU only.")
     parser.add_argument("--video-input", help="Path to video file.")
+    parser.add_argument("--batch-video", help="Path to video root.")
     parser.add_argument(
         "--input",
         nargs="+",
@@ -188,9 +190,11 @@ if __name__ == "__main__":
         video = cv2.VideoCapture(args.video_input)
         width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        frames_per_second = video.get(cv2.CAP_PROP_FPS)
+        fps = video.get(cv2.CAP_PROP_FPS)
         num_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
         basename = os.path.basename(args.video_input)
+        bar = tqdm.tqdm(total=num_frames)
+        gen = demo.run_on_video(video)
         codec, file_ext = (
             ("x264", ".mkv") if test_opencv_video_format("x264", ".mkv") else ("mp4v", ".mp4")
         )
@@ -202,27 +206,40 @@ if __name__ == "__main__":
                 output_fname = os.path.splitext(output_fname)[0] + file_ext
             else:
                 output_fname = args.output
-            assert not os.path.isfile(output_fname), output_fname
-            output_file = cv2.VideoWriter(
-                filename=output_fname,
-                # some installation of opencv may not support x264 (due to its license),
-                # you can try other format (e.g. MPEG)
-                fourcc=cv2.VideoWriter_fourcc(*codec),
-                fps=float(frames_per_second),
-                frameSize=(width, height),
-                isColor=True,
-            )
+            output_frames = []
         assert os.path.isfile(args.video_input)
-        for vis_frame in tqdm.tqdm(demo.run_on_video(video), total=num_frames):
+        for i, (viz, pred) in enumerate(gen):
             if args.output:
-                output_file.write(vis_frame)
+                output_frames.append(viz)
+                bar.update(1)
             else:
                 cv2.namedWindow(basename, cv2.WINDOW_NORMAL)
-                cv2.imshow(basename, vis_frame)
+                cv2.imshow(basename, viz)
                 if cv2.waitKey(1) == 27:
                     break  # esc to quit
         video.release()
         if args.output:
-            output_file.release()
+            ImageSequenceClip(output_frames, fps=fps).write_videofile(output_fname, audio=False)
         else:
             cv2.destroyAllWindows()
+    elif args.batch_video:
+        gen = demo.run_on_video(video)
+        bar = tqdm.tqdm(total=num_frames)
+        assert os.path.isdir(args.batch_video)
+        for f in glob.glob(f'{args.batch_video}/**/*.avi', recursive=True):
+            action, basename = f.split('/')[-2:]
+            output_frames = []
+            video = cv2.VideoCapture(f)
+            fps = video.get(cv2.CAP_PROP_FPS)
+            num_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+            for i, (viz, pred) in enumerate(gen):
+                if args.output:
+                    viz = cv2.cvtColor(viz, cv2.COLOR_BGR2RGB)
+                    output_frames.append(viz)
+                    bar.update(1)
+            video.release()
+            if args.output:
+                output_fname = os.path.join(args.output, action, basename)
+                output_fname = os.path.splitext(output_fname)[0] + '.mp4'
+                os.makedirs(os.path.join(args.output, action), exist_ok=True)
+                ImageSequenceClip(output_frames, fps=fps).write_videofile(output_fname, audio=False)
